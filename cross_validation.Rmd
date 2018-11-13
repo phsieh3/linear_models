@@ -1,0 +1,221 @@
+---
+title: "Cross_validation"
+author: "Pei Yang Hsieh"
+date: 2018-11-13
+output: html_document
+---
+
+```{r setup}
+library(tidyverse)
+library(modelr)
+library(mgcv)
+
+set.seed(1)
+```
+
+## Examples
+
+CV "by hand"
+
+```{r}
+nonlin_df = tibble(
+  id = 1:100,
+  x = runif(100, 0, 1),
+  y = 1 - 10 * (x - .3) ^ 2 + rnorm(100, 0, .3)
+)
+
+ggplot(nonlin_df, aes(x = x, y = y)) + geom_point() + theme_bw()
+```
+
+
+Partition into training and testing
+
+```{r}
+#training data set 
+train_df = sample_n(nonlin_df, 80)
+
+#test data set
+test_df = anti_join(nonlin_df, train_df, by = "id")
+
+ggplot(train_df, aes(x = x, y = y)) + 
+  geom_point() + 
+  geom_point(data = test_df, color = "red")
+```
+
+Fit a few models
+
+```{r}
+#linear model
+lin_mod = lm(y ~ x, data = train_df)
+
+#fit smooth curve
+nonlin_mod = mgcv::gam(y ~ s(x), data = train_df)
+
+#jagged model
+wiggly_mod = mgcv::gam(y ~ s(x, k = 30), sp = 10e-6, data = train_df)
+```
+
+Plot the models
+
+```{r}
+#this is good
+train_df %>% 
+  add_predictions(nonlin_mod) %>% 
+  ggplot(aes(x = x, y = y)) + geom_point() + 
+  geom_line(aes(y = pred), color = "red")
+```
+
+
+
+```{r}
+#this is less good, much too complex
+train_df %>% 
+  add_predictions(wiggly_mod) %>% 
+  ggplot(aes(x = x, y = y)) + geom_point() + 
+  geom_line(aes(y = pred), color = "red")
+```
+
+
+```{r}
+train_df %>% 
+  gather_predictions(lin_mod, nonlin_mod, wiggly_mod) %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = x, y = y)) + 
+  geom_point() + 
+  geom_line(aes(y = pred), color = "red") + 
+  facet_wrap(~model)
+```
+
+Compute root mean squared errors (RMSEs)
+
+```{r}
+rmse(lin_mod, test_df)
+## [1] 0.7163422
+rmse(nonlin_mod, test_df)
+## [1] 0.2437012
+rmse(wiggly_mod, test_df)
+## [1] 0.3471883
+```
+
+CV using modelr
+
+```{r}
+#this iterates on number of splits. in this case, does 100 random splits
+#gives new data frame with nested list columns
+cv_df = 
+  crossv_mc(nonlin_df, 100) 
+```
+
+
+Convert to data frame
+
+```{r}
+cv_df %>% pull(train) %>% .[[1]] %>% as_tibble
+
+cv_df %>% pull(test) %>% .[[1]] %>% as_tibble
+
+cv_df =
+  cv_df %>% 
+  mutate(train = map(train, as_tibble),
+         test = map(test, as_tibble))
+```
+
+Iterate using map, fits model many times
+
+```{r}
+#mutate double means it shows up as a number
+cv_df = 
+  cv_df %>% 
+  mutate(lin_mod    = map(train, ~lm(y ~ x, data = .x)),
+         nonlin_mod = map(train, ~mgcv::gam(y ~ s(x), data = .x)),
+         wiggly_mod = map(train, ~gam(y ~ s(x, k = 30), sp = 10e-6, data = .x))) %>% 
+  mutate(rmse_lin    = map2_dbl(lin_mod, test, ~rmse(model = .x, data = .y)),
+         rmse_nonlin = map2_dbl(nonlin_mod, test, ~rmse(model = .x, data = .y)),
+         rmse_wiggly = map2_dbl(wiggly_mod, test, ~rmse(model = .x, data = .y)))
+```
+
+plot below shows the distribution of RMSE values for each candidate model. Nonlinear doing best because lowest errors (y-values)
+
+```{r}
+cv_df %>% 
+  select(starts_with("rmse")) %>% 
+  gather(key = model, value = rmse) %>% 
+  mutate(model = str_replace(model, "rmse_", ""),
+         model = fct_inorder(model)) %>% 
+  ggplot(aes(x = model, y = rmse)) + geom_violin()
+```
+
+
+Nepalese children example
+
+```{r}
+child_growth = read_csv("./nepalese_children.csv")
+
+child_growth %>% 
+  ggplot(aes(x = weight, y = armc)) + 
+  geom_point(alpha = .5)
+```
+
+
+```{r}
+#define pwl split/kink around 7
+child_growth =
+  child_growth %>% 
+  mutate(weight_sp = (weight > 7) * (weight - 7))
+```
+
+
+```{r}
+lin_mod = lm(armc ~ weight, data = child_growth)
+#piecewise linear model
+pwl_mod = lm(armc ~ weight + weight_sp, data = child_growth)
+nonlin_mod = gam(armc ~ s(weight), data = child_growth)
+```
+
+Plot models
+
+```{r}
+child_growth %>% 
+  gather_predictions(lin_mod, pwl_mod, nonlin_mod) %>% 
+  mutate(model = fct_inorder(model)) %>% 
+  ggplot(aes(x = weight, y = armc)) + 
+  geom_point(alpha = .5) +
+  geom_line(aes(y = pred), color = "red") + 
+  facet_grid(~model)
+```
+
+Checck prediction errors for these models
+
+```{r}
+cv_df =
+  crossv_mc(child_growth, 100) %>% 
+  mutate(train = map(train, as_tibble),
+         test = map(test, as_tibble))
+```
+
+
+```{r}
+cv_df = 
+  cv_df %>% 
+  mutate(lin_mod = map(train, ~lm(armc ~ weight, data = .x)),
+         pwl_mod = map(train, ~lm(armc ~ weight + weight_sp, data = .x)),
+         nonlin_mod = map(train, ~gam(armc ~ s(weight), data = as_tibble(.x)))) %>% 
+  mutate(rmse_lin    = map2_dbl(lin_mod, test, ~rmse(model = .x, data = .y)),
+         rmse_pwl = map2_dbl(pwl_mod, test, ~rmse(model = .x, data = .y)),
+         rmse_nonlin = map2_dbl(nonlin_mod, test, ~rmse(model = .x, data = .y)))
+```
+
+
+Plot prediction error distributions
+
+```{r}
+cv_df %>% 
+  select(starts_with("rmse")) %>% 
+  gather(key = model, value = rmse) %>% 
+  mutate(model = str_replace(model, "rmse_", ""),
+         model = fct_inorder(model)) %>% 
+  ggplot(aes(x = model, y = rmse)) + geom_violin()
+```
+
+
+Piecewise linear fit is what Jeff would go with. It is comparable to the nonlinear and is easier to interpret because only 2 straight lines (not curves).
